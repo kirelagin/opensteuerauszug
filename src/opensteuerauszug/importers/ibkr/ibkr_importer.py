@@ -92,7 +92,9 @@ class IbkrImporter:
                 error_desc = (
                     f"{object_description} (Symbol: " f"{getattr(data_object, 'symbol', 'N/A')})"
                 )
-            elif hasattr(data_object, 'accountId') and 'Account:' not in object_description:  # Avoid double "Account:"
+            elif (
+                hasattr(data_object, 'accountId') and 'Account:' not in object_description
+            ):  # Avoid double "Account:"
                 error_desc = (
                     f"{object_description} (Account: "
                     f"{getattr(data_object, 'accountId', 'N/A')})"
@@ -159,6 +161,20 @@ class IbkrImporter:
                     pass
         return None
 
+    def _source_identifiers(self, entry: object) -> tuple[str | None, int | None]:
+        """Extract source identifiers without manufacturing model identifiers."""
+        isin = getattr(entry, "isin", None)
+        security_id = getattr(entry, "securityID", None)
+        security_id_type = str(getattr(entry, "securityIDType", "") or "").upper()
+        if not isin and security_id_type == "ISIN":
+            isin = security_id
+        if security_id_type not in {"VALOR", "VALORNUMBER"} or security_id is None:
+            return isin or None, None
+        try:
+            return isin or None, int(str(security_id))
+        except ValueError:
+            return isin or None, None
+
     def _maybe_update_security_country(
         self,
         security_country_map: Dict[SecurityPosition, str],
@@ -187,6 +203,8 @@ class IbkrImporter:
         period_to: date,
         account_settings_list: List[IbkrAccountSettings],
         render_language: Language = DEFAULT_LANGUAGE,
+        segregate_proven_closed_options: bool = False,
+        boundary_filenames: Optional[List[str]] = None,
     ):
         """
         Initialize the importer with a tax period.
@@ -196,11 +214,17 @@ class IbkrImporter:
             period_to (date): The end date of the tax period.
             account_settings_list: List of IBKR account settings.
             render_language (Language): Language for translations.
+            segregate_proven_closed_options: Exclude only options with source-proven
+                zero opening and closing checkpoints and no reportable payments.
+            boundary_filenames: Optional Flex XML snapshot sources used only to
+                establish source checkpoints, never to import activity or cash.
         """
         self.period_from = period_from
         self.period_to = period_to
         self.account_settings_list = account_settings_list
         self.render_language = render_language
+        self.segregate_proven_closed_options = segregate_proven_closed_options
+        self.boundary_filenames = boundary_filenames or []
 
         if not self.account_settings_list:
             # Currently no account info is used so we keep stumm.
@@ -278,6 +302,49 @@ class IbkrImporter:
                 if statement.tag.rsplit("}", 1)[-1] != "FlexStatement":
                     continue
                 if not any(child.tag.rsplit("}", 1)[-1] == "OpenPositions" for child in statement):
+                    continue
+                keys.add(
+                    (
+                        statement.get("accountId", ""),
+                        self._as_date(statement.get("fromDate")),
+                        self._as_date(statement.get("toDate")),
+                    )
+                )
+        return keys
+
+    def _has_complete_nonoverlapping_coverage(self, ranges: Sequence[tuple[date, date]]) -> bool:
+        """Return whether source-declared ranges cover the requested period exactly once."""
+        relevant_ranges = sorted(
+            (max(start, self.period_from), min(end, self.period_to))
+            for start, end in ranges
+            if start <= self.period_to and end >= self.period_from
+        )
+        expected_start = self.period_from
+        for start, end in relevant_ranges:
+            if start != expected_start:
+                return False
+            expected_start = end + timedelta(days=1)
+        return expected_start > self.period_to
+
+    def _activity_coverage_keys(
+        self, filenames: Sequence[str]
+    ) -> set[tuple[str, date | None, date | None]]:
+        """Return ranges that explicitly declare every security activity section.
+
+        A source range can prove that no unreported option event occurred only
+        when it declares Trades, Transfers, CorporateActions, and
+        CashTransactions. Empty elements are valid evidence; omitted elements
+        are not.
+        """
+        required_sections = {"Trades", "Transfers", "CorporateActions", "CashTransactions"}
+        keys = set()
+        for filename in filenames:
+            root = ElementTree.parse(filename).getroot()
+            for statement in root.iter():
+                if statement.tag.rsplit("}", 1)[-1] != "FlexStatement":
+                    continue
+                section_names = {child.tag.rsplit("}", 1)[-1] for child in statement}
+                if not required_sections <= section_names:
                     continue
                 keys.add(
                     (
@@ -466,6 +533,13 @@ class IbkrImporter:
             error_label="IBKR Flex XML file",
         )
 
+        boundary_flex_statements = self._parse_flex_statements(
+            self.boundary_filenames,
+            file_label="IBKR boundary Flex statement file",
+            log_label="IBKR boundary Flex statement",
+            error_label="IBKR boundary Flex XML file",
+        )
+
         if not all_flex_statements:
             # This might be an error or just a case of no relevant data.
             # "If data is missing do a hard error" - might need adjustment
@@ -493,14 +567,42 @@ class IbkrImporter:
             lambda: {'stocks': [], 'payments': []}
         )
         security_country_map: Dict[SecurityPosition, str] = {}
-        open_positions_snapshot_keys = self._open_positions_snapshot_keys(filenames)
+        open_positions_snapshot_keys = self._open_positions_snapshot_keys(
+            [*filenames, *self.boundary_filenames]
+        )
+        activity_coverage_keys = self._activity_coverage_keys(filenames)
         accounts_with_period_end_open_positions: set[str] = set()
+        complete_open_position_snapshots: set[tuple[str, date]] = set()
+        snapshot_positions: Dict[tuple[str, date], Dict[str, tuple[Decimal, str]]] = {}
+        ambiguous_snapshot_dates: set[tuple[str, date]] = set()
+        ambiguous_snapshot_positions: set[tuple[str, date, str]] = set()
+        source_coverage_ranges: defaultdict[str, list[tuple[date, date]]] = defaultdict(list)
 
         # Map to store assetCategory and subCategory for each security
         security_asset_category_map: Dict[SecurityPosition, tuple[str, Optional[str]]] = {}
+        security_asset_categories: defaultdict[SecurityPosition, set[str]] = defaultdict(set)
+        security_event_kinds: defaultdict[SecurityPosition, set[str]] = defaultdict(set)
+        source_contract_identities: defaultdict[
+            tuple[str, str], set[tuple[str | None, int | None]]
+        ] = defaultdict(set)
+        source_contract_categories: defaultdict[tuple[str, str], set[str]] = defaultdict(set)
         rights_issue_positions: set[SecurityPosition] = set()
 
-        for stmt in all_flex_statements:
+        def record_source_contract(
+            depot: str,
+            contract: str,
+            isin: str | None,
+            valor: int | None,
+            asset_category: str | None,
+        ) -> None:
+            source_contract_identities[(depot, contract)].add((isin, valor))
+            if asset_category:
+                source_contract_categories[(depot, contract)].add(asset_category)
+
+        for stmt, is_boundary_source in [
+            *((stmt, False) for stmt in all_flex_statements),
+            *((stmt, True) for stmt in boundary_flex_statements),
+        ]:
             account_id = self._get_required_field(stmt, 'accountId', 'FlexStatement')
             source_from = self._as_date(getattr(stmt, "fromDate", None))
             source_to = self._as_date(getattr(stmt, "toDate", None))
@@ -515,8 +617,74 @@ class IbkrImporter:
                     if not should_skip_pseudo_account_entry(open_pos)
                 )
             )
-            if is_period_end_open_positions_snapshot:
+            if is_period_end_open_positions_snapshot and not is_boundary_source:
                 accounts_with_period_end_open_positions.add(account_id)
+
+            # An explicit OpenPositions element is an account-wide checkpoint,
+            # including when it is empty. Preserve its per-contract evidence
+            # separately from the eCH stock history so option segregation never
+            # guesses an absent boundary balance from net trades.
+            snapshot_date = source_to
+            is_complete_open_positions_snapshot = (
+                (account_id, source_from, source_to) in open_positions_snapshot_keys
+                and snapshot_date is not None
+                and open_positions is not None
+                and all(
+                    self._as_date(getattr(open_pos, "reportDate", None)) == snapshot_date
+                    for open_pos in open_positions
+                    if not should_skip_pseudo_account_entry(open_pos)
+                )
+            )
+            if is_complete_open_positions_snapshot:
+                complete_open_position_snapshots.add((account_id, snapshot_date))
+                positions_at_snapshot: Dict[str, tuple[Decimal, str]] = {}
+                for open_pos in open_positions:
+                    if should_skip_pseudo_account_entry(open_pos):
+                        continue
+                    snapshot_conid = str(
+                        self._get_required_field(open_pos, "conid", "OpenPosition")
+                    )
+                    snapshot_category = self._get_required_field(
+                        open_pos, "assetCategory", "OpenPosition"
+                    )
+                    snapshot_quantity = self._to_decimal(
+                        self._get_required_field(open_pos, "position", "OpenPosition"),
+                        "position",
+                        f"OpenPosition {snapshot_conid}",
+                    )
+                    snapshot_isin, snapshot_valor = self._source_identifiers(open_pos)
+                    record_source_contract(
+                        account_id,
+                        snapshot_conid,
+                        snapshot_isin,
+                        snapshot_valor,
+                        snapshot_category,
+                    )
+                    if snapshot_conid in positions_at_snapshot:
+                        ambiguous_snapshot_positions.add(
+                            (account_id, snapshot_date, snapshot_conid)
+                        )
+                        continue
+                    positions_at_snapshot[snapshot_conid] = (
+                        snapshot_quantity,
+                        snapshot_category,
+                    )
+                snapshot_key = (account_id, snapshot_date)
+                previous_snapshot = snapshot_positions.get(snapshot_key)
+                if previous_snapshot is not None and previous_snapshot != positions_at_snapshot:
+                    ambiguous_snapshot_dates.add(snapshot_key)
+                else:
+                    snapshot_positions[snapshot_key] = positions_at_snapshot
+
+            if is_boundary_source:
+                continue
+            if (
+                (account_id, source_from, source_to) in activity_coverage_keys
+                and source_from is not None
+                and source_to is not None
+                and source_from <= source_to
+            ):
+                source_coverage_ranges[account_id].append((source_from, source_to))
 
             # account_id_processed = account_id # Keep track for summary
             logger.info(f"Processing statement for account: {account_id}")
@@ -611,6 +779,12 @@ class IbkrImporter:
                     sub_category = getattr(trade, 'subCategory', None)
                     if sec_pos not in security_asset_category_map:
                         security_asset_category_map[sec_pos] = (asset_category, sub_category)
+                    security_asset_categories[sec_pos].add(asset_category)
+                    security_event_kinds[sec_pos].add("trade")
+                    source_isin, source_valor = self._source_identifiers(trade)
+                    record_source_contract(
+                        account_id, conid, source_isin, source_valor, asset_category
+                    )
 
                     trade_country = self._normalize_country_code(
                         getattr(trade, 'issuerCountryCode', None)
@@ -712,6 +886,11 @@ class IbkrImporter:
                     sub_category = getattr(open_pos, 'subCategory', None)
                     if sec_pos not in security_asset_category_map:
                         security_asset_category_map[sec_pos] = (asset_category, sub_category)
+                    security_asset_categories[sec_pos].add(asset_category)
+                    source_isin, source_valor = self._source_identifiers(open_pos)
+                    record_source_contract(
+                        account_id, conid, source_isin, source_valor, asset_category
+                    )
 
                     position_country = self._normalize_country_code(
                         getattr(open_pos, 'issuerCountryCode', None)
@@ -828,6 +1007,12 @@ class IbkrImporter:
                     )
 
                     processed_security_positions[sec_pos]['stocks'].append(stock_mutation)
+                    security_asset_categories[sec_pos].add(str(asset_cat_val))
+                    security_event_kinds[sec_pos].add("transfer")
+                    source_isin, source_valor = self._source_identifiers(transfer)
+                    record_source_contract(
+                        account_id, conid, source_isin, source_valor, str(asset_cat_val)
+                    )
 
             # --- Process Corporate Actions ---
             if stmt.CorporateActions:
@@ -909,6 +1094,16 @@ class IbkrImporter:
                     )
 
                     processed_security_positions[sec_pos]["stocks"].append(stock_mutation)
+                    security_event_kinds[sec_pos].add("corporate_action")
+                    action_asset_category = getattr(action, "assetCategory", None)
+                    source_isin, source_valor = self._source_identifiers(action)
+                    record_source_contract(
+                        account_id,
+                        conid,
+                        source_isin,
+                        source_valor,
+                        str(action_asset_category) if action_asset_category else None,
+                    )
 
             # --- Process Cash Transactions ---
             if stmt.CashTransactions:
@@ -973,6 +1168,15 @@ class IbkrImporter:
                                     asset_category,
                                     sub_category,
                                 )
+                            security_asset_categories[sec_pos_key].add(asset_category)
+                        source_isin, source_valor = self._source_identifiers(cash_tx)
+                        record_source_contract(
+                            account_id,
+                            str(security_id),
+                            source_isin,
+                            source_valor,
+                            asset_category,
+                        )
 
                         # Update name metadata (Priority: 0 for CashTransactions - lowest)
                         # Use description or symbol if description is generic?
@@ -1040,6 +1244,116 @@ class IbkrImporter:
                         )
                         processed_cash_positions[cash_pos_key]['payments'].append(bank_payment)
 
+        # Corrections are payment evidence for opt-in segregation. Preserve the
+        # historical no-flag ordering by importing them later in that path.
+        if self.segregate_proven_closed_options and corrections_filenames:
+            self._import_corrections_flex_files(
+                corrections_filenames,
+                processed_security_positions,
+            )
+
+        if self.segregate_proven_closed_options:
+            opening_snapshot_date = self.period_from - timedelta(days=1)
+            ending_snapshot_date = self.period_to
+            excluded_positions: list[SecurityPosition] = []
+            for sec_pos, data in processed_security_positions.items():
+                asset_categories = security_asset_categories[sec_pos]
+                event_kinds = security_event_kinds[sec_pos]
+                mutations = [stock for stock in data["stocks"] if stock.mutation]
+                boundary_balances = [stock for stock in data["stocks"] if not stock.mutation]
+                opening_snapshot = snapshot_positions.get(
+                    (sec_pos.depot, opening_snapshot_date), {}
+                )
+                ending_snapshot = snapshot_positions.get((sec_pos.depot, ending_snapshot_date), {})
+                opening_evidence = opening_snapshot.get(sec_pos.symbol)
+                ending_evidence = ending_snapshot.get(sec_pos.symbol)
+                mutation_quantity = sum((stock.quantity for stock in mutations), Decimal("0"))
+                source_proven_closing = (
+                    Decimal("0") if ending_evidence is None else ending_evidence[0]
+                )
+                source_proven_opening = (
+                    Decimal("0") if opening_evidence is None else opening_evidence[0]
+                )
+                derived_opening = source_proven_closing - mutation_quantity
+                has_opening_checkpoint = (
+                    sec_pos.depot,
+                    opening_snapshot_date,
+                ) in complete_open_position_snapshots
+                has_complete_coverage = self._has_complete_nonoverlapping_coverage(
+                    source_coverage_ranges[sec_pos.depot]
+                )
+                contract_key = (sec_pos.depot, sec_pos.symbol)
+                contract_identities = source_contract_identities[contract_key]
+                has_source_identifier = any(
+                    source_isin is not None or source_valor is not None
+                    for source_isin, source_valor in contract_identities
+                )
+                has_contract_collision = (
+                    len(contract_identities) > 1
+                    or len(source_contract_categories[contract_key]) > 1
+                )
+                is_ambiguous = (
+                    sec_pos.depot,
+                    opening_snapshot_date,
+                    sec_pos.symbol,
+                ) in ambiguous_snapshot_positions or (
+                    sec_pos.depot,
+                    ending_snapshot_date,
+                    sec_pos.symbol,
+                ) in ambiguous_snapshot_positions
+
+                if (
+                    asset_categories
+                    and asset_categories <= {"OPT", "FOP"}
+                    and event_kinds == {"trade"}
+                    and mutations
+                    and all(
+                        self.period_from <= stock.referenceDate <= self.period_to
+                        for stock in mutations
+                    )
+                    and mutation_quantity == 0
+                    and has_complete_coverage
+                    and not has_source_identifier
+                    and not has_contract_collision
+                    and not data["payments"]
+                    and (sec_pos.depot, ending_snapshot_date) in complete_open_position_snapshots
+                    and source_proven_closing == 0
+                    and (
+                        (has_opening_checkpoint and source_proven_opening == 0)
+                        or (has_complete_coverage and derived_opening == 0)
+                    )
+                    and (not has_opening_checkpoint or source_proven_opening == derived_opening)
+                    and (sec_pos.depot, opening_snapshot_date) not in ambiguous_snapshot_dates
+                    and (sec_pos.depot, ending_snapshot_date) not in ambiguous_snapshot_dates
+                    and not is_ambiguous
+                    and (opening_evidence is None or opening_evidence[0] == 0)
+                    and (ending_evidence is None or ending_evidence[0] == 0)
+                    and all(
+                        stock.referenceDate
+                        in (self.period_from, self.period_to + timedelta(days=1))
+                        and stock.quantity == 0
+                        and stock.balance in (None, Decimal("0"))
+                        for stock in boundary_balances
+                    )
+                ):
+                    excluded_positions.append(sec_pos)
+                elif asset_categories and asset_categories <= {"OPT", "FOP"}:
+                    logger.info(
+                        "Retained IBKR option because closed-option segregation evidence is incomplete: "
+                        "depot=%s contract=%s.",
+                        sec_pos.depot,
+                        sec_pos.symbol,
+                    )
+
+            for sec_pos in excluded_positions:
+                del processed_security_positions[sec_pos]
+                logger.info(
+                    "Excluded source-proven closed IBKR option from supported-assets statement: "
+                    "depot=%s contract=%s. Retain separate broker activity and settlement evidence.",
+                    sec_pos.depot,
+                    sec_pos.symbol,
+                )
+
         # A part-year import needs a complete period-end OpenPositions snapshot
         # for every account represented by security data. A stale or omitted
         # snapshot cannot establish either a security's end balance or a zero
@@ -1085,11 +1399,9 @@ class IbkrImporter:
             )
 
         # --- Process Corrections Flex Files ---
-        # Import withholding-tax corrections from a post-year-end flex export.
-        # Only CashTransactions whose settleDate falls within the tax period
-        # are included, so that reversals/adjustments are netted against the
-        # original deductions automatically during reconciliation.
-        if corrections_filenames:
+        # Preserve the historical ordering unless opt-in segregation needed
+        # correction payments as eligibility evidence above.
+        if not self.segregate_proven_closed_options and corrections_filenames:
             self._import_corrections_flex_files(
                 corrections_filenames,
                 processed_security_positions,
@@ -1131,6 +1443,14 @@ class IbkrImporter:
             name_registry=security_name_registry,
             hints_for=_hints_for,
         )
+        tax_statement.segregated_closed_option_count = (
+            len(excluded_positions) if self.segregate_proven_closed_options else 0
+        )
+        if tax_statement.segregated_closed_option_count:
+            logger.info(
+                "Segregated %d source-proven closed IBKR option position(s) from the eCH output.",
+                tax_statement.segregated_closed_option_count,
+            )
 
         # --- Collect per-account dateOpened / dateClosed + CashReport seeds ---
         account_dates: Dict[str, Dict[str, date | None]] = {}

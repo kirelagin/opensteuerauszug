@@ -116,6 +116,7 @@ TRANSLATIONS = {
     "warning": "warning",
     "warnings": "warnings",
     "critical_warnings_hint": "This statement has <b>{count}</b> critical {plural}. Please review the information pages at the end of this document.",
+    "closed_option_segregation_notice": "This statement omits <b>{count}</b> source-proven closed IBKR option position(s) from the eCH securities schedule. Provide the original broker activity and settlement evidence separately. This is not a tax-classification decision.",
     # === XML TRANSLATIONS ===
     "debit_interest": "Interest Payments",
     "credit_interest": "Credit Interest",

@@ -118,6 +118,7 @@ Wertschriftenverzeichnis einzusetzen.''',
     'warning': 'Warnung',
     'warnings': 'Warnungen',
     'critical_warnings_hint': 'Dieser Steuerauszug enthält <b>{count}</b> kritische {plural}. Bitte überprüfen Sie die Informationsseiten am Ende dieses Dokuments.',
+    'closed_option_segregation_notice': 'Dieser Auszug lässt <b>{count}</b> quellenbelegte geschlossene IBKR-Optionsposition(en) aus dem eCH-Wertschriftenverzeichnis weg. Reichen Sie die Original-Brokeraktivität und den Abrechnungsnachweis separat ein. Dies ist keine steuerliche Klassifizierung.',
     # === XML TRANSLATIONS ===
     "debit_interest": "Sollzinsen",
     "credit_interest": "Habenzinsen",

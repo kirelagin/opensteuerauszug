@@ -207,6 +207,16 @@ def process(
         "--corrections-flex",
         help="IBKR Flex Query XML file(s) covering the post-year-end period (e.g. Jan–Mar of the following year). Only withholding-tax CashTransactions whose settleDate falls within the tax period are imported, allowing 1042-S corrections to be netted.",
     ),
+    segregate_proven_closed_options: bool = typer.Option(
+        False,
+        "--segregate-proven-closed-options",
+        help="IBKR only: omit only source-proven fully closed options from eCH output and disclose them in the PDF.",
+    ),
+    boundary_flex: Optional[List[Path]] = typer.Option(
+        None,
+        "--boundary-flex",
+        help="IBKR Flex XML source(s) used only as explicit opening/end Open Positions checkpoints for closed-option segregation.",
+    ),
     use_broker_withholding: UseBrokerWithholding = typer.Option(
         UseBrokerWithholding.CAP,
         "--use-broker-withholding",
@@ -242,6 +252,12 @@ def process(
 
     print("Starting OpenSteuerauszug processing...")
     print(f"Input file: {input_file}")
+    if segregate_proven_closed_options and (importer_type != ImporterType.IBKR or raw_import):
+        print("Error: --segregate-proven-closed-options is available only with --importer ibkr.")
+        raise typer.Exit(code=2)
+    if boundary_flex and not segregate_proven_closed_options:
+        print("Error: --boundary-flex requires --segregate-proven-closed-options.")
+        raise typer.Exit(code=2)
     # ... (rest of initial print statements and date parsing logic remains the same) ...
     parsed_period_from: Optional[date] = None
     parsed_period_to: Optional[date] = None
@@ -613,6 +629,10 @@ def process(
                     period_to=parsed_period_to,
                     account_settings_list=all_ibkr_account_settings_models,
                     render_language=render_language,
+                    segregate_proven_closed_options=segregate_proven_closed_options,
+                    boundary_filenames=(
+                        [str(path) for path in boundary_flex] if boundary_flex else None
+                    ),
                 )
                 corrections_files = [str(p) for p in corrections_flex] if corrections_flex else None
                 statement = ibkr_importer.import_files(

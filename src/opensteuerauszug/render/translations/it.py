@@ -116,6 +116,7 @@ TRANSLATIONS = {
     "warning": "avviso",
     "warnings": "avvisi",
     "critical_warnings_hint": "Questo estratto contiene <b>{count}</b> {plural} critico/i. Si prega di consultare le pagine informative alla fine di questo documento.",
+    "closed_option_segregation_notice": "Questo estratto omette <b>{count}</b> posizione/i di opzioni IBKR chiusa/e e comprovata/e dalla fonte dall'elenco titoli eCH. Fornire separatamente l'attività originale del broker e le prove di regolamento. Questa non è una decisione di classificazione fiscale.",
     # === XML TRANSLATIONS ===
     "debit_interest": "Pagamenti di interessi",
     "credit_interest": "Interessi attivi",

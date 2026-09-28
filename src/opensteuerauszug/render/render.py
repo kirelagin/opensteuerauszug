@@ -1372,6 +1372,36 @@ def create_critical_warnings_flowables(warnings: list, styles, usable_width) -> 
     return [Spacer(1, 4 * mm), table, Spacer(1, 4 * mm)]
 
 
+def create_closed_option_segregation_notice(count: int, styles, usable_width) -> list:
+    """Create the PDF-only disclosure for source-proven excluded IBKR options."""
+    if count == 0:
+        return []
+
+    notice_style = ParagraphStyle(
+        name="ClosedOptionSegregationNotice",
+        parent=styles["Normal"],
+        fontSize=9,
+        fontName=FONT_BOLD,
+        textColor=_WARNING_TEXT_COLOR,
+        leading=12,
+    )
+    text = t("closed_option_segregation_notice").format(count=count)
+    table = Table([[Paragraph(text, notice_style)]], colWidths=[usable_width])
+    table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, -1), _WARNING_BG),
+                ("BOX", (0, 0), (-1, -1), 1, _WARNING_BORDER),
+                ("LEFTPADDING", (0, 0), (-1, -1), 4 * mm),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 4 * mm),
+                ("TOPPADDING", (0, 0), (-1, -1), 3 * mm),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 3 * mm),
+            ]
+        )
+    )
+    return [Spacer(1, 4 * mm), table, Spacer(1, 4 * mm)]
+
+
 def create_critical_warnings_hint(warnings: list, styles) -> list:
     """Create a short banner for the summary page hinting that warnings exist.
 
@@ -2743,8 +2773,15 @@ def render_tax_statement(
         # Info boxes below the summary table
         story.append(create_dual_info_boxes(styles, usable_width))
 
-    # Show a prominent hint on the summary page when critical warnings exist
+    # Show prominent PDF-only notices on the summary page.
     story.extend(create_critical_warnings_hint(critical_warnings, styles))
+    story.extend(
+        create_closed_option_segregation_notice(
+            tax_statement.segregated_closed_option_count,
+            styles,
+            usable_width,
+        )
+    )
 
     # --- Bank Accounts Section ---
     bank_table = create_bank_accounts_table(tax_statement, styles, usable_width)

@@ -1909,6 +1909,8 @@ class TaxStatement(TaxStatementBase):
     payment_reconciliation_report: Optional[PaymentReconciliationReport] = Field(
         default=None, exclude=True
     )
+    # IBKR-only source-backed segregation metadata, never serialized to eCH XML.
+    segregated_closed_option_count: int = Field(default=0, exclude=True)
 
     model_config = {
         "json_schema_extra": {'tag_name': 'taxStatement', 'tag_namespace': NS_MAP['eCH-0196']}

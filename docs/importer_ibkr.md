@@ -78,6 +78,19 @@ Because Interactive Brokers specifies relatively complete data in its exports, t
 opensteuerauszug process --importer ibkr <flex query xml file> ...
 ```
 
+### Optional source-proven closed-option segregation
+
+`--segregate-proven-closed-options` is an explicit IBKR-only mode for a supported-assets statement. It omits only unsupported options with no source ISIN or Valor from the eCH securities schedule when IBKR's explicit account-wide period-end Open Positions checkpoint proves a zero quantity, every in-period option mutation balances to zero, and the importer has no associated period payment. Complete, non-overlapping source-declared activity coverage of every day in the requested period is always required, even when a prior-day checkpoint proves the opening zero. Every covered source range must explicitly declare `Trades`, `Transfers`, `CorporateActions`, and `CashTransactions`; genuinely empty elements are valid evidence, omitted elements are not. The opening zero may be independently sourced or strictly reconstructed from the zero end balance and complete activity coverage. The option must be identified consistently within the same IBKR account and must not have transfer or corporate-action mutations. Missing or stale checkpoints, incomplete or overlapping coverage, a live or pre-period position, a payment, an unbalanced mutation, a source identifier, or ambiguous contract identity fail closed: the option remains in the statement with its usual warnings.
+
+The mode does not infer cash settlement from a zero-price `BookTrade`, `netCash`, or net trades. Cash remains sourced independently from `CashReport` and is unchanged. The PDF states how many options were omitted and requires the original broker activity and settlement evidence to be provided separately; the eCH XML intentionally contains only the supported sections. This opt-in flag is not a tax-classification engine and makes no filing determination.
+
+An ordinary full-period Flex export with an explicit period-end `OpenPositions` section and all required activity sections supplies the required end checkpoint and coverage; it does not need a redundant opening export. `--boundary-flex` may provide corroborating prior-day boundary evidence but never replaces complete activity coverage. Boundary files are read only as checkpoints and never import their activity or cash. An empty explicit section is meaningful: it proves that the account had no open positions at that checkpoint. An omitted section is not evidence.
+
+```console
+opensteuerauszug process --importer ibkr annual_flex.xml \
+  --segregate-proven-closed-options
+```
+
 ## Withholding-Tax Corrections (1042-S Reclassification)
 
 Some US bond ETFs (e.g. **BND**, **SGOV**) have their dividend income reclassified by IBKR after year-end once the 1042-S forms are filed. IBKR initially withholds 15% US tax, but later reverses some or all of it when "Interest-Related Dividends from a RIC" are determined to be exempt from US withholding tax.
