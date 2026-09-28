@@ -68,6 +68,13 @@ include = '\.pyi?$'
 [tool.hatch.metadata]
 allow-direct-references = true
 
+[tool.hatch.build.targets.wheel.force-include]
+"specs/eCH-0007-6-0.xsd" = "opensteuerauszug/specs/eCH-0007-6-0.xsd"
+"specs/eCH-0008-3-0.xsd" = "opensteuerauszug/specs/eCH-0008-3-0.xsd"
+"specs/eCH-0010-7-0.xsd" = "opensteuerauszug/specs/eCH-0010-7-0.xsd"
+"specs/eCH-0097-4-0.xsd" = "opensteuerauszug/specs/eCH-0097-4-0.xsd"
+"specs/eCH-0196-2-2.xsd" = "opensteuerauszug/specs/eCH-0196-2-2.xsd"
+
 [tool.isort]
 profile = "black"
 multi_line_output = 3

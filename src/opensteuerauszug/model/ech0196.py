@@ -20,6 +20,8 @@ from typing import (
 from datetime import date, datetime
 from enum import Enum
 from decimal import Decimal
+from importlib.resources import files
+from pathlib import Path
 import lxml.etree as ET
 from inspect import isclass
 import logging
@@ -29,6 +31,40 @@ from .critical_warning import CriticalWarning
 from .payment_reconciliation import PaymentReconciliationReport
 
 logger = logging.getLogger(__name__)
+
+_ECH0196_SCHEMA_FILENAMES = (
+    "eCH-0196-2-2.xsd",
+    "eCH-0007-6-0.xsd",
+    "eCH-0008-3-0.xsd",
+    "eCH-0010-7-0.xsd",
+    "eCH-0097-4-0.xsd",
+)
+
+
+def _ech0196_schema_directories() -> list[Path]:
+    """Return packaged and source-tree locations for the eCH-0196 schemas."""
+    package_schemas = Path(files("opensteuerauszug").joinpath("specs"))
+    source_schemas = Path(__file__).resolve().parents[3] / "specs"
+    return [package_schemas, source_schemas]
+
+
+def _get_ech0196_schema_directory() -> Path:
+    """Return a complete eCH-0196 schema directory or fail closed."""
+    missing_by_directory = []
+    for schema_directory in _ech0196_schema_directories():
+        missing = [
+            filename
+            for filename in _ECH0196_SCHEMA_FILENAMES
+            if not (schema_directory / filename).is_file()
+        ]
+        if not missing:
+            return schema_directory
+        missing_by_directory.append(f"{schema_directory}: {', '.join(missing)}")
+    raise FileNotFoundError(
+        "Required eCH-0196 XSD schema data are unavailable. Missing files: "
+        + "; ".join(missing_by_directory)
+    )
+
 
 # Define namespaces used in the XSD
 NS_MAP = {
@@ -1812,9 +1848,7 @@ class TaxStatementBase(BaseXmlModel):
         Returns:
             bool: True if validation passes
         """
-        from pathlib import Path
-
-        specs_dir = Path("specs")
+        specs_dir = _get_ech0196_schema_directory()
         xsd_path = specs_dir / "eCH-0196-2-2.xsd"
 
         output_required_errors = self._validate_output_required_fields()
@@ -1824,10 +1858,6 @@ class TaxStatementBase(BaseXmlModel):
             )
             logger.error(error_message)
             raise ValueError(error_message)
-
-        if not xsd_path.exists():
-            logger.warning(f"XSD schema file not found at {xsd_path}. Skipping validation.")
-            return True
 
         # Custom resolver to handle schema imports
         class _LocalXsdResolver(ET.Resolver):

@@ -7,6 +7,7 @@ from pydantic import Field
 
 from tests.utils import normalize_xml, get_sample_files
 
+import opensteuerauszug.model.ech0196 as ech0196
 from opensteuerauszug.model.ech0196 import (
     TaxStatement,
     Institution,
@@ -58,6 +59,36 @@ def get_sample_tax_xml_files():
 
 
 # --- Tests ---
+
+
+def _synthetic_tax_statement() -> TaxStatement:
+    return TaxStatement.from_xml_file(
+        Path(__file__).parents[1] / "samples" / "fake_statement.xml", strict=True
+    )
+
+
+def test_schema_validation_uses_source_schemas_outside_repository_cwd(
+    tmp_path, monkeypatch, caplog
+):
+    statement = _synthetic_tax_statement()
+    caplog.set_level("INFO", logger="opensteuerauszug.model.ech0196")
+    monkeypatch.chdir(tmp_path)
+
+    assert statement.validate_model()
+    assert "XSD validation successful." in caplog.text
+    assert "Skipping validation" not in caplog.text
+
+
+def test_schema_validation_fails_closed_when_required_schema_data_are_missing(
+    tmp_path, monkeypatch
+):
+    statement = _synthetic_tax_statement()
+    monkeypatch.setattr(ech0196, "_ech0196_schema_directories", lambda: [tmp_path])
+
+    with pytest.raises(
+        FileNotFoundError, match="Required eCH-0196 XSD schema data are unavailable"
+    ):
+        statement.validate_model()
 
 
 def test_tax_statement_creation(sample_tax_statement_data):
