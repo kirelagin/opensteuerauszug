@@ -30,16 +30,18 @@ You will need to download data for your Brokerage accounts and any Equity Awards
     4.  Choose **CSV format** for the download.
 *   **Format Details for Developers**:
     *   The CSV file has a few header lines before the actual data. The importer is designed to handle this.
-    *   Key columns used: `Symbol`, `Description`, `Qty (Quantity)`, `Cost Basis`.
+    *   The CSV must retain Schwab's original `Positions for account ... as of ...` account/date header. Its table header must contain `Symbol`, `Qty (Quantity)`, `Mkt Val (Market Value)`, and either `Asset Type` or `Security Type`, even when an individual row uses only the cash or security fields. Each security row must have a real numeric `Qty (Quantity)`. A `Cash & Cash Investments` row must have `Mkt Val (Market Value)`.
+    *   A normal `Positions Total` aggregate row is ignored and is not treated as a holding.
     *   Example structure (simplified):
         ```csv
         "Positions for account Individual ...123 as of ...","","","..."
         "","","","..."
-        "Symbol","Description","Qty (Quantity)","Price","Cost Basis","..."
-        "SCHB","SCHWAB US BROAD MARKET ETF","100.00","$50.00","..."
+        "Symbol","Description","Qty (Quantity)","Price","Mkt Val (Market Value)","Asset Type"
+        "SCHB","SCHWAB US BROAD MARKET ETF","100.00","$50.00","$5000.00","Equity"
         ```
 * Note that the account number is truncated, we will fix this later in the config file.
 *   **Important**: Schwab typically only allows downloading positions for the *current day*. If you cannot get an exact year-end position file, the system may rely more heavily on transaction data to reconstruct positions, or you might need to use the [Manual Positions Fallback CSV](#3-manual-positions-fallback-csv-optional).
+*   **Important**: the CSV will contain exactly the same columns that you see in the table. If you have previously adjusted the settings using the “Customize” button, make sure the following required columns are present: `Qty (Quantity)`, `Mkt Val (Market Value)`.
 
 **b) Transactions File (JSON)**
 

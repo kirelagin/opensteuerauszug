@@ -1,5 +1,8 @@
 import os
 import tempfile
+
+import pytest
+
 from opensteuerauszug.importers.schwab.position_extractor import PositionExtractor
 from opensteuerauszug.model.position import SecurityPosition
 
@@ -67,6 +70,52 @@ def test_asset_type_column_identifies_security_positions():
     assert pos.symbol == 'META'
     assert pos.security_type == 'Equity'
     assert stock.quantity == 111
+
+
+def test_positions_total_footer_is_not_a_holding():
+    csv_content = (
+        '"Positions for account Individual ...632 as of 02:19 PM ET, 2026/05/11"\n'
+        '\n'
+        '"Symbol","Description","Qty (Quantity)","Price","Mkt Val (Market Value)","Asset Type"\n'
+        '"META","META PLATFORMS INC",111,"$601.2701","$66,740.98","Equity"\n'
+        '"Positions Total","",,"","$66,740.98",""\n'
+    )
+    extractor = PositionExtractor("synthetic.csv")
+
+    result = extractor._extract_positions_from_string(csv_content)
+
+    assert result is not None
+    positions, _, _ = result
+    assert [pos.symbol for pos, _ in positions if isinstance(pos, SecurityPosition)] == ["META"]
+
+
+def test_extra_column_row_is_rejected():
+    csv_content = (
+        '"Positions for account Individual ...632 as of 02:19 PM ET, 2026/05/11"\n'
+        '\n'
+        '"Symbol","Description","Qty (Quantity)","Price","Mkt Val (Market Value)","Asset Type"\n'
+        '"META","META PLATFORMS INC",111,"$601.2701","$66,740.98","Equity","unexpected"\n'
+    )
+    extractor = PositionExtractor("synthetic.csv")
+
+    with pytest.raises(ValueError, match="malformed row"):
+        extractor._extract_positions_from_string(csv_content)
+
+
+def test_missing_or_nonnumeric_quantity_is_rejected():
+    header = (
+        '"Positions for account Individual ...632 as of 02:19 PM ET, 2026/05/11"\n'
+        '"Symbol","Description","Qty (Quantity)","Mkt Val (Market Value)","Asset Type"\n'
+    )
+    row = '"META","Synthetic Holdings",111,"$100.00","Equity"\n'
+    extractor = PositionExtractor("synthetic.csv")
+
+    with pytest.raises(ValueError, match="missing required columns.*Qty"):
+        extractor._extract_positions_from_string(
+            header.replace('"Qty (Quantity)",', "") + row.replace("111,", "")
+        )
+    with pytest.raises(ValueError, match="nonnumeric quantity"):
+        extractor._extract_positions_from_string(header + row.replace("111", '"not-a-number"'))
 
 
 def test_extract_positions_invalid():

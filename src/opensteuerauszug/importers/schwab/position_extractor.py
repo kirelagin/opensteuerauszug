@@ -55,40 +55,66 @@ class PositionExtractor:
         else:
             return None
         reader = csv.DictReader(lines[header_idx:], skipinitialspace=True)
+        header = reader.fieldnames or []
+        required_columns = {"Symbol", "Qty (Quantity)", "Mkt Val (Market Value)"}
+        missing_columns = required_columns - set(header)
+        if "Security Type" not in header and "Asset Type" not in header:
+            missing_columns.add("Asset Type or Security Type")
+        if missing_columns:
+            raise ValueError(
+                "Schwab positions CSV is missing required columns: "
+                + ", ".join(sorted(missing_columns))
+                + ". Re-export the Positions CSV with these columns enabled."
+            )
+
         positions: List[Tuple[Position, SecurityStock]] = []
         for row in reader:
-            symbol = row.get('Symbol', '').strip()
-            security_type = (
-                row.get('Security Type', '').strip() or row.get('Asset Type', '').strip()
-            )
-            qty_str = row.get('Qty (Quantity)', '').replace(',', '').strip()
-            mkt_val_str = (
-                row.get('Mkt Val (Market Value)', '').replace(',', '').replace('$', '').strip()
-            )
-            description = row.get('Description', '').strip() if 'Description' in row else None
-            try:
-                quantity = Decimal(qty_str) if qty_str else Decimal('0')
-            except InvalidOperation:
-                quantity = Decimal('0')
+            # DictReader uses None for missing cells and as the key for surplus cells.
+            if None in row or any(not isinstance(value, str) for value in row.values()):
+                raise ValueError("Schwab positions CSV contains a malformed row")
+
+            def cell(name: str) -> str:
+                return row[name].strip() if name in row else ""
+
+            symbol = cell("Symbol")
+            if not symbol and all(not cell(name) for name in header):
+                continue
+            # Schwab's aggregate total is not a position.
+            if symbol == "Positions Total":
+                continue
+
+            security_type = cell("Security Type") or cell("Asset Type")
+            qty_str = cell("Qty (Quantity)").replace(",", "")
+            mkt_val_str = cell("Mkt Val (Market Value)").replace(",", "").replace("$", "")
+            description = cell("Description") if "Description" in header else None
             depot = partial_account_number
-            if symbol == 'Cash & Cash Investments':
-                # Cash position
+            if symbol == "Cash & Cash Investments":
                 try:
                     amount = Decimal(mkt_val_str)
-                except InvalidOperation:
-                    amount = Decimal('0')
-                pos = CashPosition(depot=depot, currentCy='USD')
+                    if not amount.is_finite():
+                        raise InvalidOperation
+                except InvalidOperation as exc:
+                    raise ValueError("Schwab positions CSV has a nonnumeric cash value") from exc
+                pos = CashPosition(depot=depot, currentCy="USD")
                 stock = SecurityStock(
                     referenceDate=ref_date,
                     mutation=False,
-                    quotationType='PIECE',
+                    quotationType="PIECE",
                     quantity=amount,
-                    balanceCurrency='USD',
+                    balanceCurrency="USD",
                     balance=amount,
                 )
                 positions.append((pos, stock))
-            elif symbol and ' ' not in symbol and security_type:
-                # Security position
+            elif symbol and " " not in symbol and security_type:
+                try:
+                    quantity = Decimal(qty_str)
+                    if not quantity.is_finite():
+                        raise InvalidOperation
+                except InvalidOperation as exc:
+                    raise ValueError(
+                        f"Schwab positions CSV has a nonnumeric quantity for security '{symbol}'. "
+                        "Re-export the Positions CSV or provide evidence-backed manual quantities."
+                    ) from exc
                 pos = SecurityPosition(
                     depot=depot,
                     symbol=symbol,
@@ -100,12 +126,14 @@ class PositionExtractor:
                 stock = SecurityStock(
                     referenceDate=ref_date,
                     mutation=False,
-                    quotationType='PIECE',
+                    quotationType="PIECE",
                     quantity=quantity,
-                    balanceCurrency='USD',
+                    balanceCurrency="USD",
                 )
                 positions.append((pos, stock))
-            # else: skip rows that don't match expected security/cash
+            else:
+                raise ValueError("Schwab positions CSV contains an unrecognized position row")
+
         return positions, ref_date, partial_account_number
 
 
