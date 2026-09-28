@@ -2773,15 +2773,15 @@ def render_tax_statement(
         # Info boxes below the summary table
         story.append(create_dual_info_boxes(styles, usable_width))
 
-    # Show prominent PDF-only notices on the summary page.
-    story.extend(create_critical_warnings_hint(critical_warnings, styles))
-    story.extend(
-        create_closed_option_segregation_notice(
-            tax_statement.segregated_closed_option_count,
-            styles,
-            usable_width,
-        )
-    )
+    ## Show prominent PDF-only notices on the summary page.
+    # story.extend(create_critical_warnings_hint(critical_warnings, styles))
+    # story.extend(
+    #    create_closed_option_segregation_notice(
+    #        tax_statement.segregated_closed_option_count,
+    #        styles,
+    #        usable_width,
+    #    )
+    # )
 
     # --- Bank Accounts Section ---
     bank_table = create_bank_accounts_table(tax_statement, styles, usable_width)
