@@ -113,8 +113,11 @@ class WithholdingCapCalculator:
                 kl_payment.nonRecoverableTaxAmount or Decimal("0")
             )
 
-            # No cap needed when broker WHT is at or above kursliste.
-            if broker_wht_chf >= kurs_wht_chf - self.tolerance_chf:
+            # An explicitly evidenced zero broker WHT must always reverse a
+            # positive Kursliste estimate. For nonzero amounts, retain the
+            # normal positive-to-positive tolerance.
+            broker_wht_is_zero = broker_wht_chf == Decimal("0")
+            if not broker_wht_is_zero and broker_wht_chf >= kurs_wht_chf - self.tolerance_chf:
                 continue
 
             # A cap is needed. Check for multiple WHT payments on the same
@@ -127,8 +130,9 @@ class WithholdingCapCalculator:
                     f"Cannot apply withholding cap."
                 )
 
-            # Decide whether this is a full reversal (≈0) or partial.
-            if broker_wht_chf <= self.tolerance_chf:
+            # Only an exact zero is a full reversal. A small but nonzero
+            # broker withholding must remain subject to partial-cap handling.
+            if broker_wht_is_zero:
                 # Full reversal – move everything to grossRevenueB (no WHT).
                 self._apply_full_reversal(security, kl_payment, kurs_wht_chf, d)
             elif (

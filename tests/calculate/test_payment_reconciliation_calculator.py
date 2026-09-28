@@ -1428,6 +1428,151 @@ def test_withholding_cap_zeros_when_broker_has_no_wht_entries():
     assert kl_payment.sign is None
 
 
+def _make_tiny_withholding_statement(broker_payments):
+    return TaxStatement(
+        minorVersion=2,
+        listOfSecurities=ListOfSecurities(
+            depot=[
+                Depot(
+                    depotNumber=DepotNumber("D1"),
+                    security=[
+                        Security(
+                            positionId=1,
+                            country="US",
+                            currency="USD",
+                            quotationType="PIECE",
+                            securityCategory="SHARE",
+                            securityName="SYNTHETIC WITHHOLDING TEST",
+                            payment=[
+                                SecurityPayment(
+                                    paymentDate=date(2030, 1, 2),
+                                    quotationType="PIECE",
+                                    quantity=Decimal("1"),
+                                    amountCurrency="USD",
+                                    amount=Decimal("0.20"),
+                                    exchangeRate=Decimal("1"),
+                                    grossRevenueA=Decimal("0.20"),
+                                    grossRevenueB=Decimal("0"),
+                                    withHoldingTaxClaim=Decimal("0.04"),
+                                    nonRecoverableTaxAmount=Decimal("0"),
+                                    kursliste=True,
+                                    sign="(Q)",
+                                )
+                            ],
+                            broker_payments=broker_payments,
+                        )
+                    ],
+                )
+            ]
+        ),
+    )
+
+
+def test_tiny_kursliste_withholding_is_reversed_for_explicit_zero_broker_withholding():
+    broker_payment = SecurityPayment(
+        paymentDate=date(2030, 1, 2),
+        quotationType="PIECE",
+        quantity=Decimal("1"),
+        amountCurrency="USD",
+        amount=Decimal("0.20"),
+        name="Synthetic dividend",
+    )
+    statement = _make_tiny_withholding_statement([broker_payment])
+
+    WithholdingCapCalculator().calculate(statement)
+    PaymentReconciliationCalculator().calculate(statement)
+
+    payment = statement.listOfSecurities.depot[0].security[0].payment[0]
+    assert payment.grossRevenueA == Decimal("0.00")
+    assert payment.grossRevenueB == Decimal("0.20")
+    assert payment.withHoldingTaxClaim == Decimal("0.00")
+    assert payment.nonRecoverableTaxAmount == Decimal("0.00")
+    assert payment.withholding_capped is True
+    assert payment.withholding_capped_original_wht_chf == Decimal("0.04")
+    assert broker_payment.amount == Decimal("0.20")
+
+    report = statement.payment_reconciliation_report
+    assert report is not None
+    assert report.capped_count == 1
+    assert report.mismatch_count == 0
+    row = report.rows[0]
+    assert row.status == "capped"
+    assert row.matched is True
+    assert row.kursliste_withholding_chf == Decimal("0.04")
+    assert row.broker_dividend_amount == Decimal("0.20")
+
+
+def test_tiny_nonzero_broker_withholding_is_partially_capped_not_reversed():
+    broker_payments = [
+        SecurityPayment(
+            paymentDate=date(2030, 1, 2),
+            quotationType="PIECE",
+            quantity=Decimal("1"),
+            amountCurrency="USD",
+            amount=Decimal("0.20"),
+            name="Synthetic dividend",
+        ),
+        SecurityPayment(
+            paymentDate=date(2030, 1, 2),
+            quotationType="PIECE",
+            quantity=Decimal("1"),
+            amountCurrency="USD",
+            nonRecoverableTaxAmountOriginal=Decimal("0.01"),
+        ),
+    ]
+    statement = _make_tiny_withholding_statement(broker_payments)
+    payment = statement.listOfSecurities.depot[0].security[0].payment[0]
+    payment.grossRevenueA = Decimal("0")
+    payment.grossRevenueB = Decimal("0.20")
+    payment.withHoldingTaxClaim = Decimal("0")
+    payment.nonRecoverableTaxAmount = Decimal("0.10")
+
+    WithholdingCapCalculator().calculate(statement)
+    PaymentReconciliationCalculator().calculate(statement)
+
+    assert payment.grossRevenueA == Decimal("0")
+    assert payment.grossRevenueB == Decimal("0.20")
+    assert payment.withHoldingTaxClaim == Decimal("0")
+    assert payment.nonRecoverableTaxAmount == Decimal("0.01")
+    assert payment.withholding_capped is True
+    assert payment.withholding_capped_original_wht_chf == Decimal("0.10")
+    assert broker_payments[0].amount == Decimal("0.20")
+
+    report = statement.payment_reconciliation_report
+    assert report is not None
+    assert report.capped_count == 1
+    assert report.mismatch_count == 0
+    row = report.rows[0]
+    assert row.status == "capped"
+    assert row.matched is True
+    assert row.kursliste_withholding_chf == Decimal("0.10")
+    assert row.broker_withholding_amount == Decimal("0.01")
+
+
+def test_tiny_kursliste_withholding_is_not_reversed_without_broker_payment():
+    statement = _make_tiny_withholding_statement([])
+
+    WithholdingCapCalculator().calculate(statement)
+    PaymentReconciliationCalculator().calculate(statement)
+
+    payment = statement.listOfSecurities.depot[0].security[0].payment[0]
+    assert payment.grossRevenueA == Decimal("0.20")
+    assert payment.grossRevenueB == Decimal("0")
+    assert payment.withHoldingTaxClaim == Decimal("0.04")
+    assert payment.nonRecoverableTaxAmount == Decimal("0")
+    assert payment.withholding_capped is False
+
+    report = statement.payment_reconciliation_report
+    assert report is not None
+    assert report.capped_count == 0
+    assert report.mismatch_count == 1
+    row = report.rows[0]
+    assert row.status == "mismatch"
+    assert row.matched is False
+    assert row.kursliste_withholding_chf == Decimal("0.04")
+    assert row.broker_dividend_amount is None
+
+
 def test_us_w8ben_hint_does_not_crash_when_broker_has_no_withholding_payment():
     """When the broker reports a US dividend without an accompanying withholding
     entry, broker_with_chf stays None. The W8-BEN heuristic must not divide by it."""
