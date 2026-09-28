@@ -152,6 +152,15 @@ def _get_configured_account_info(
             return None, f"...{depot_short_id}"
 
 
+def _is_configured_brokerage_depot(
+    depot_short_id: str, account_settings_list: List[SchwabAccountSettings]
+) -> bool:
+    """Return whether *depot_short_id* identifies a configured brokerage account."""
+    return depot_short_id != "AWARDS" and any(
+        setting.account_number.endswith(depot_short_id) for setting in account_settings_list
+    )
+
+
 def _resolve_security_depot_display_name(
     depot_short_id: str, account_settings_list: List[SchwabAccountSettings]
 ) -> str:
@@ -338,9 +347,22 @@ class SchwabImporter:
                 extractor = TransactionExtractor(filename, self.render_language)
                 transactions = extractor.extract_transactions()
                 if transactions is not None:
+                    coverage_transactions = []
+                    for transaction in transactions:
+                        position, _, _, depot, _ = transaction
+                        if position is None and not _is_configured_brokerage_depot(
+                            depot, self.account_settings_list
+                        ):
+                            logger.warning(
+                                "Ignoring empty Schwab brokerage export for unconfigured account suffix ...%s.",
+                                depot,
+                            )
+                            continue
+                        coverage_transactions.append(transaction)
+
                     newly_covered_segments = defaultdict(list)
                     # TODO this loops partly sill as the coverage is the same for all transactions
-                    for _, _, _, depot, (start_date, end_date) in transactions:
+                    for _, _, _, depot, (start_date, end_date) in coverage_transactions:
                         if depot in newly_covered_segments:
                             continue
                         if depot not in depot_coverage:
@@ -385,7 +407,16 @@ class SchwabImporter:
                         # Now, mark the entire transaction range as covered in the main tracker for future transactions
                         depot_coverage[depot].mark_covered(start_date, end_date)
 
-                    for position, stocks, payments, depot, (start_date, end_date) in transactions:
+                    for (
+                        position,
+                        stocks,
+                        payments,
+                        depot,
+                        (start_date, end_date),
+                    ) in coverage_transactions:
+                        if position is None:
+                            continue
+
                         filtered_stocks = []
                         if stocks:
                             for stock_item in stocks:

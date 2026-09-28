@@ -1,5 +1,7 @@
 import logging
 import json
+import os
+import re
 from typing import List, Optional, Tuple, Any
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
@@ -83,7 +85,7 @@ class TransactionExtractor:
     ) -> Optional[
         List[
             Tuple[
-                Position,
+                Optional[Position],
                 List[SecurityStock],
                 Optional[List[SecurityPayment]],
                 str,
@@ -93,8 +95,8 @@ class TransactionExtractor:
     ]:
         """
         Parses the JSON file and returns a list of tuples:
-            (Position, list of SecurityStock, optional list of SecurityPayment, depot, covered date range)
-        The actual extraction logic is stubbed out.
+            (Position or None, stocks, payments, depot, covered date range)
+        A None position is a coverage-only marker from a valid empty brokerage export.
         """
         with open(self.filename, 'r', encoding='utf-8') as f:
             data = json.load(f)
@@ -103,7 +105,7 @@ class TransactionExtractor:
     def _extract_transactions_from_dict(self, data: dict) -> Optional[
         List[
             Tuple[
-                Position,
+                Optional[Position],
                 List[SecurityStock],
                 Optional[List[SecurityPayment]],
                 str,
@@ -132,6 +134,9 @@ class TransactionExtractor:
             # print(f"Warning: Could not parse FromDate ('{from_date_str}') or ToDate ('{to_date_str}').")
             return None
 
+        if start_date > end_date:
+            return None
+
         date_range = (start_date, end_date)
 
         processed_transactions = []
@@ -139,6 +144,21 @@ class TransactionExtractor:
         raw_transactions: List[dict]
 
         if "BrokerageTransactions" in data:
+            raw_transactions = data.get("BrokerageTransactions", [])
+            if raw_transactions == []:
+                depot = self._extract_empty_brokerage_depot()
+                if depot is None:
+                    logger.warning(
+                        "Ignoring empty Schwab BrokerageTransactions export with an "
+                        "unrecognizable account filename: %s",
+                        self.filename,
+                    )
+                    return None
+                # A valid empty brokerage export proves date coverage but does
+                # not represent a cash or security event. The importer treats
+                # the None position as a coverage-only marker.
+                return [(None, [], None, depot, date_range)]
+
             # Attempt to extract account number from filename for depot
             # Filename format: Individual_XXX178_Transactions_20250309-115444.json
             try:
@@ -166,7 +186,6 @@ class TransactionExtractor:
                     f"Warning: Could not parse depot from filename: {self.filename}. Using 'UNKNOWN_BROKERAGE_DEPOT'."
                 )
                 depot = "UNKNOWN_BROKERAGE_DEPOT"
-            raw_transactions = data.get("BrokerageTransactions", [])
         elif "Transactions" in data:
             depot = "AWARDS"
             raw_transactions = data.get("Transactions", [])
@@ -310,6 +329,20 @@ class TransactionExtractor:
                 processed_transactions.append((pos, stocks, payments, pos.depot, date_range))
 
         return processed_transactions if processed_transactions else None
+
+    def _extract_empty_brokerage_depot(self) -> Optional[str]:
+        """Extract a brokerage depot only from Schwab's original export name.
+
+        Coverage from an empty file has no transaction row to tie it to an
+        account. Accept it only when the filename contains an original-form
+        numeric account suffix, rather than falling back to an anonymous depot.
+        """
+        filename = os.path.basename(self.filename)
+        match = re.match(r"^.+_([A-Za-z]*\d{3,})_Transactions_\d{8}-\d{6}\.json$", filename)
+        if match is None:
+            return None
+        numeric_part = ''.join(filter(str.isdigit, match.group(1)))
+        return numeric_part[-3:]
 
     def _parse_schwab_decimal(self, value_str: Optional[str]) -> Optional[Decimal]:
         if value_str is None or value_str == "":
