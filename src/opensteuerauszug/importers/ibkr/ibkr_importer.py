@@ -5,6 +5,8 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from collections import defaultdict
 
+from defusedxml import ElementTree
+
 logger = logging.getLogger(__name__)
 
 from opensteuerauszug.model.position import SecurityPosition
@@ -140,6 +142,23 @@ class IbkrImporter:
             return None
         return country[:2]
 
+    def _as_date(self, value: object | None) -> date | None:
+        """Normalize Flex date fields, including compact ``YYYYMMDD`` values."""
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, date):
+            return value
+        if isinstance(value, str):
+            value = value.split(";")[0].split("T")[0]
+            for date_format in ("%Y-%m-%d", "%Y%m%d"):
+                try:
+                    return datetime.strptime(value, date_format).date()
+                except ValueError:
+                    pass
+        return None
+
     def _maybe_update_security_country(
         self,
         security_country_map: Dict[SecurityPosition, str],
@@ -242,6 +261,32 @@ class IbkrImporter:
                 raise RuntimeError(f"An unexpected error occurred while parsing {filename}: {e}")
 
         return statements
+
+    def _open_positions_snapshot_keys(
+        self, filenames: Sequence[str]
+    ) -> set[tuple[str, date | None, date | None]]:
+        """Return keys for Flex statements that explicitly contain OpenPositions.
+
+        ibflex parses both an omitted OpenPositions XML element and an empty
+        OpenPositions XML element as an empty tuple. Only an explicit empty
+        element proves that the account had no open positions at that snapshot.
+        """
+        keys = set()
+        for filename in filenames:
+            root = ElementTree.parse(filename).getroot()
+            for statement in root.iter():
+                if statement.tag.rsplit("}", 1)[-1] != "FlexStatement":
+                    continue
+                if not any(child.tag.rsplit("}", 1)[-1] == "OpenPositions" for child in statement):
+                    continue
+                keys.add(
+                    (
+                        statement.get("accountId", ""),
+                        self._as_date(statement.get("fromDate")),
+                        self._as_date(statement.get("toDate")),
+                    )
+                )
+        return keys
 
     def _find_processed_security_position(
         self,
@@ -448,6 +493,8 @@ class IbkrImporter:
             lambda: {'stocks': [], 'payments': []}
         )
         security_country_map: Dict[SecurityPosition, str] = {}
+        open_positions_snapshot_keys = self._open_positions_snapshot_keys(filenames)
+        accounts_with_period_end_open_positions: set[str] = set()
 
         # Map to store assetCategory and subCategory for each security
         security_asset_category_map: Dict[SecurityPosition, tuple[str, Optional[str]]] = {}
@@ -455,6 +502,22 @@ class IbkrImporter:
 
         for stmt in all_flex_statements:
             account_id = self._get_required_field(stmt, 'accountId', 'FlexStatement')
+            source_from = self._as_date(getattr(stmt, "fromDate", None))
+            source_to = self._as_date(getattr(stmt, "toDate", None))
+            open_positions = getattr(stmt, "OpenPositions", None)
+            is_period_end_open_positions_snapshot = (
+                (account_id, source_from, source_to) in open_positions_snapshot_keys
+                and source_to == self.period_to
+                and open_positions is not None
+                and all(
+                    self._as_date(getattr(open_pos, "reportDate", None)) == self.period_to
+                    for open_pos in open_positions
+                    if not should_skip_pseudo_account_entry(open_pos)
+                )
+            )
+            if is_period_end_open_positions_snapshot:
+                accounts_with_period_end_open_positions.add(account_id)
+
             # account_id_processed = account_id # Keep track for summary
             logger.info(f"Processing statement for account: {account_id}")
 
@@ -601,18 +664,14 @@ class IbkrImporter:
 
             # --- Process Open Positions (End of Period Snapshot) ---
             if stmt.OpenPositions:
-                end_plus_one = self.period_to + timedelta(days=1)
                 for open_pos in stmt.OpenPositions:
                     if should_skip_entry(open_pos, "OpenPosition"):
                         continue
-                    # Ignore the reportDate from the Flex statement and
-                    # use period end + 1 as reference date for the balance
-                    # entry. This avoids creating a separate stock entry on
-                    # the period end itself which would later result in a
-                    # duplicate closing balance.
-                    _ = self._get_required_field(
-                        open_pos, 'reportDate', 'OpenPosition'
-                    )  # validation only
+                    report_date = self._as_date(
+                        self._get_required_field(open_pos, 'reportDate', 'OpenPosition')
+                    )
+                    if report_date is None:
+                        raise ValueError("OpenPosition has an invalid reportDate")
                     symbol = self._get_required_field(open_pos, 'symbol', 'OpenPosition')
                     description = self._get_required_field(open_pos, 'description', 'OpenPosition')
                     asset_category = self._get_required_field(
@@ -680,8 +739,11 @@ class IbkrImporter:
                         )
 
                     balance_stock = SecurityStock(
-                        # Balance as of the period end + 1
-                        referenceDate=end_plus_one,
+                        # IBKR's reportDate is an end-of-day balance, while an
+                        # eCH stock referenceDate represents the following
+                        # start-of-day. Preserve the actual snapshot date rather
+                        # than labelling every OpenPosition as period end.
+                        referenceDate=report_date + timedelta(days=1),
                         mutation=False,
                         quantity=quantity,
                         balanceCurrency=currency,
@@ -977,6 +1039,50 @@ class IbkrImporter:
                             amount=amount,
                         )
                         processed_cash_positions[cash_pos_key]['payments'].append(bank_payment)
+
+        # A part-year import needs a complete period-end OpenPositions snapshot
+        # for every account represented by security data. A stale or omitted
+        # snapshot cannot establish either a security's end balance or a zero
+        # balance for a security absent from the snapshot. Reject the account
+        # before per-security reconciliation can extrapolate from a midyear
+        # checkpoint. January-to-December imports retain their existing logic.
+        is_annual_period = self.period_from == date(
+            self.period_to.year, 1, 1
+        ) and self.period_to == date(self.period_to.year, 12, 31)
+        if not is_annual_period:
+            security_accounts = {sec_pos.depot for sec_pos in processed_security_positions}
+            accounts_without_period_end_snapshot = (
+                security_accounts - accounts_with_period_end_open_positions
+            )
+            if accounts_without_period_end_snapshot:
+                account_ids = ", ".join(sorted(accounts_without_period_end_snapshot))
+                raise ValueError(
+                    "Cannot infer part-year boundary balances for account(s) "
+                    f"{account_ids}: no verified period-end OpenPositions checkpoint."
+                )
+
+        # A security omitted from a verified period-end OpenPositions snapshot
+        # is proven to close at zero, so add the explicit eCH closing checkpoint.
+        end_plus_one = self.period_to + timedelta(days=1)
+        for sec_pos, data in processed_security_positions.items():
+            stocks = data["stocks"]
+            if any(not stock.mutation for stock in stocks):
+                continue
+
+            if is_annual_period:
+                continue
+
+            currency = stocks[0].balanceCurrency if stocks else data["payments"][0].amountCurrency
+            quotation_type = stocks[0].quotationType if stocks else "PIECE"
+            stocks.append(
+                SecurityStock(
+                    referenceDate=end_plus_one,
+                    mutation=False,
+                    quotationType=quotation_type,
+                    quantity=Decimal("0"),
+                    balanceCurrency=currency,
+                )
+            )
 
         # --- Process Corrections Flex Files ---
         # Import withholding-tax corrections from a post-year-end flex export.

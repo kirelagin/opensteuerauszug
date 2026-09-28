@@ -303,6 +303,57 @@ SAMPLE_IBKR_FLEX_XML_WITH_HYPHEN_ACCOUNT_ENTRIES = """
 """
 
 
+def _part_year_boundary_flex(
+    *,
+    source_from: date,
+    source_to: date,
+    include_pre_period_trades: bool = False,
+    include_in_period_trades: bool = True,
+    open_position_report_date: date | None = None,
+) -> str:
+    pre_period_trades = (
+        """
+        <Trade transactionID="1" accountId="U1234567" assetCategory="STK" symbol="LIQ" description="LIQUIDATED" conid="1001" isin="US0000000001" currency="USD" quantity="10" tradeDate="2024-01-10" settleDateTarget="2024-01-12" tradePrice="10" tradeMoney="100" buySell="BUY" ibCommission="0" />
+        <Trade transactionID="2" accountId="U1234567" assetCategory="STK" symbol="ZERO" description="START DAY" conid="1002" isin="US0000000002" currency="USD" quantity="3" tradeDate="2024-02-01" settleDateTarget="2024-02-03" tradePrice="10" tradeMoney="30" buySell="BUY" ibCommission="0" />
+        <Trade transactionID="3" accountId="U1234567" assetCategory="STK" symbol="ZERO" description="START DAY" conid="1002" isin="US0000000002" currency="USD" quantity="-3" tradeDate="2024-02-02" settleDateTarget="2024-02-04" tradePrice="10" tradeMoney="-30" buySell="SELL" ibCommission="0" />
+    """
+        if include_pre_period_trades
+        else ""
+    )
+    in_period_trades = (
+        """
+        <Trade transactionID="4" accountId="U1234567" assetCategory="STK" symbol="LIQ" description="LIQUIDATED" conid="1001" isin="US0000000001" currency="USD" quantity="-10" tradeDate="2024-08-01" settleDateTarget="2024-08-03" tradePrice="10" tradeMoney="-100" buySell="SELL" ibCommission="0" />
+        <Trade transactionID="5" accountId="U1234567" assetCategory="STK" symbol="ZERO" description="START DAY" conid="1002" isin="US0000000002" currency="USD" quantity="5" tradeDate="2024-07-01" settleDateTarget="2024-07-03" tradePrice="10" tradeMoney="50" buySell="BUY" ibCommission="0" />
+        <Trade transactionID="6" accountId="U1234567" assetCategory="STK" symbol="ZERO" description="START DAY" conid="1002" isin="US0000000002" currency="USD" quantity="-5" tradeDate="2024-08-02" settleDateTarget="2024-08-04" tradePrice="10" tradeMoney="-50" buySell="SELL" ibCommission="0" />
+    """
+        if include_in_period_trades
+        else ""
+    )
+    open_positions = ""
+    if open_position_report_date is not None:
+        open_positions = f"""
+        <OpenPositions>
+          <OpenPosition accountId="U1234567" assetCategory="STK" symbol="ANCHOR" description="ANCHOR" conid="9999" isin="US0000000009" currency="USD" position="1" markPrice="10" positionValue="10" reportDate="{open_position_report_date}" />
+        </OpenPositions>
+        """
+    return f"""
+<FlexQueryResponse queryName="PartYearBoundary" type="AF">
+  <FlexStatements count="1">
+    <FlexStatement accountId="U1234567" fromDate="{source_from}" toDate="{source_to}" period="Year" whenGenerated="2025-01-15T10:00:00">
+      <Trades>
+        {pre_period_trades}
+        {in_period_trades}
+      </Trades>
+      {open_positions}
+      <CashReport>
+        <CashReportCurrency accountId="U1234567" currency="USD" endingCash="0" />
+      </CashReport>
+    </FlexStatement>
+  </FlexStatements>
+</FlexQueryResponse>
+"""
+
+
 @pytest.fixture
 def sample_ibkr_settings() -> List[IbkrAccountSettings]:
     return [
@@ -327,6 +378,220 @@ def sample_ibkr_settings_other_account() -> List[IbkrAccountSettings]:
             full_name="Test User Missing",  # Placeholder
         )
     ]
+
+
+def test_part_year_full_and_period_sources_have_matching_boundary_balances(sample_ibkr_settings):
+    period_from = date(2024, 7, 1)
+    period_to = date(2024, 12, 31)
+    importer = IbkrImporter(period_from, period_to, sample_ibkr_settings)
+
+    with (
+        tempfile.NamedTemporaryFile(mode="w", suffix=".xml") as full_file,
+        tempfile.NamedTemporaryFile(mode="w", suffix=".xml") as part_file,
+    ):
+        full_file.write(
+            _part_year_boundary_flex(
+                source_from=date(2024, 1, 1),
+                source_to=period_to,
+                include_pre_period_trades=True,
+                open_position_report_date=period_to,
+            )
+        )
+        full_file.flush()
+        part_file.write(
+            _part_year_boundary_flex(
+                source_from=period_from,
+                source_to=period_to,
+                open_position_report_date=period_to,
+            )
+        )
+        part_file.flush()
+
+        full_statement = importer.import_files([full_file.name])
+        part_statement = importer.import_files([part_file.name])
+
+    assert full_statement.listOfSecurities is not None
+    assert part_statement.listOfSecurities is not None
+    full_securities = {s.isin: s for s in full_statement.listOfSecurities.depot[0].security}
+    part_securities = {s.isin: s for s in part_statement.listOfSecurities.depot[0].security}
+
+    for isin, expected_opening in {
+        "US0000000001": Decimal("10"),
+        "US0000000002": Decimal("0"),
+    }.items():
+        full_security = full_securities[isin]
+        part_security = part_securities[isin]
+        for security in (full_security, part_security):
+            opening = next(
+                (
+                    stock.quantity
+                    for stock in security.stock
+                    if not stock.mutation and stock.referenceDate == period_from
+                ),
+                Decimal("0"),
+            )
+            closing = next(
+                stock.quantity
+                for stock in security.stock
+                if not stock.mutation and stock.referenceDate == period_to + timedelta(days=1)
+            )
+            movements = sum(
+                (
+                    stock.quantity
+                    for stock in security.stock
+                    if stock.mutation and period_from <= stock.referenceDate <= period_to
+                ),
+                Decimal("0"),
+            )
+            assert opening == expected_opening
+            assert opening + movements == closing
+
+        full_in_period = [
+            (stock.referenceDate, stock.mutation, stock.quantity)
+            for stock in full_security.stock
+            if stock.referenceDate >= period_from
+        ]
+        part_in_period = [
+            (stock.referenceDate, stock.mutation, stock.quantity)
+            for stock in part_security.stock
+            if stock.referenceDate >= period_from
+        ]
+        assert full_in_period == part_in_period
+
+    zero_start_day_mutations = [
+        stock.quantity
+        for stock in full_securities["US0000000002"].stock
+        if stock.mutation and stock.referenceDate == period_from
+    ]
+    assert zero_start_day_mutations == [Decimal("5")]
+
+
+def test_part_year_without_checkpoint_does_not_invent_boundary_balance(sample_ibkr_settings):
+    importer = IbkrImporter(date(2024, 7, 1), date(2024, 12, 31), sample_ibkr_settings)
+    xml = _part_year_boundary_flex(
+        source_from=date(2024, 7, 1),
+        source_to=date(2024, 12, 31),
+    )
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".xml") as input_file:
+        input_file.write(xml)
+        input_file.flush()
+        with pytest.raises(ValueError, match="no verified period-end OpenPositions checkpoint"):
+            importer.import_files([input_file.name])
+
+
+def test_part_year_same_security_round_trip_does_not_prove_zero_closing(sample_ibkr_settings):
+    importer = IbkrImporter(date(2024, 7, 1), date(2024, 12, 31), sample_ibkr_settings)
+    xml = """
+<FlexQueryResponse queryName="RoundTripWithoutCheckpoint" type="AF">
+  <FlexStatements count="1">
+    <FlexStatement accountId="U1234567" fromDate="2024-07-01" toDate="2024-12-31" period="Year" whenGenerated="2025-01-15T10:00:00">
+      <Trades>
+        <Trade transactionID="1" accountId="U1234567" assetCategory="STK" symbol="ROUND" description="ROUND TRIP" conid="3001" isin="US0000000013" currency="USD" quantity="5" tradeDate="2024-08-01" settleDateTarget="2024-08-03" tradePrice="10" tradeMoney="50" buySell="BUY" ibCommission="0" />
+        <Trade transactionID="2" accountId="U1234567" assetCategory="STK" symbol="ROUND" description="ROUND TRIP" conid="3001" isin="US0000000013" currency="USD" quantity="-5" tradeDate="2024-08-02" settleDateTarget="2024-08-04" tradePrice="10" tradeMoney="-50" buySell="SELL" ibCommission="0" />
+      </Trades>
+      <CashReport><CashReportCurrency accountId="U1234567" currency="USD" endingCash="0" /></CashReport>
+    </FlexStatement>
+  </FlexStatements>
+</FlexQueryResponse>
+"""
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".xml") as input_file:
+        input_file.write(xml)
+        input_file.flush()
+        with pytest.raises(ValueError, match="no verified period-end OpenPositions checkpoint"):
+            importer.import_files([input_file.name])
+
+
+def test_part_year_account_offsets_do_not_prove_per_security_zero_closing(sample_ibkr_settings):
+    importer = IbkrImporter(date(2024, 7, 1), date(2024, 12, 31), sample_ibkr_settings)
+    xml = """
+<FlexQueryResponse queryName="OffsettingTransactions" type="AF">
+  <FlexStatements count="1">
+    <FlexStatement accountId="U1234567" fromDate="2024-07-01" toDate="2024-12-31" period="Year" whenGenerated="2025-01-15T10:00:00">
+      <Trades>
+        <Trade transactionID="1" accountId="U1234567" assetCategory="STK" symbol="PLUS" description="PLUS" conid="2001" isin="US0000000011" currency="USD" quantity="7" tradeDate="2024-08-01" settleDateTarget="2024-08-03" tradePrice="10" tradeMoney="70" buySell="BUY" ibCommission="0" />
+        <Trade transactionID="2" accountId="U1234567" assetCategory="STK" symbol="MINUS" description="MINUS" conid="2002" isin="US0000000012" currency="USD" quantity="-7" tradeDate="2024-08-02" settleDateTarget="2024-08-04" tradePrice="10" tradeMoney="-70" buySell="SELL" ibCommission="0" />
+      </Trades>
+      <CashReport><CashReportCurrency accountId="U1234567" currency="USD" endingCash="0" /></CashReport>
+    </FlexStatement>
+  </FlexStatements>
+</FlexQueryResponse>
+"""
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".xml") as input_file:
+        input_file.write(xml)
+        input_file.flush()
+        with pytest.raises(ValueError, match="no verified period-end OpenPositions checkpoint"):
+            importer.import_files([input_file.name])
+
+
+def test_january_to_june_transaction_only_source_requires_period_end_checkpoint(
+    sample_ibkr_settings,
+):
+    importer = IbkrImporter(date(2024, 1, 1), date(2024, 6, 30), sample_ibkr_settings)
+    xml = """
+<FlexQueryResponse queryName="FirstHalfWithoutCheckpoint" type="AF">
+  <FlexStatements count="1">
+    <FlexStatement accountId="U1234567" fromDate="2024-01-01" toDate="2024-06-30" period="Custom" whenGenerated="2024-07-01T10:00:00">
+      <Trades>
+        <Trade transactionID="1" accountId="U1234567" assetCategory="STK" symbol="HALF" description="FIRST HALF" conid="4001" isin="US0000000014" currency="USD" quantity="5" tradeDate="2024-03-01" settleDateTarget="2024-03-03" tradePrice="10" tradeMoney="50" buySell="BUY" ibCommission="0" />
+        <Trade transactionID="2" accountId="U1234567" assetCategory="STK" symbol="HALF" description="FIRST HALF" conid="4001" isin="US0000000014" currency="USD" quantity="-5" tradeDate="2024-03-02" settleDateTarget="2024-03-04" tradePrice="10" tradeMoney="-50" buySell="SELL" ibCommission="0" />
+      </Trades>
+      <CashReport><CashReportCurrency accountId="U1234567" currency="USD" endingCash="0" /></CashReport>
+    </FlexStatement>
+  </FlexStatements>
+</FlexQueryResponse>
+"""
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".xml") as input_file:
+        input_file.write(xml)
+        input_file.flush()
+        with pytest.raises(ValueError, match="no verified period-end OpenPositions checkpoint"):
+            importer.import_files([input_file.name])
+
+
+def test_part_year_midyear_open_position_does_not_prove_period_end_balance(sample_ibkr_settings):
+    importer = IbkrImporter(date(2024, 7, 1), date(2024, 12, 31), sample_ibkr_settings)
+    xml = _part_year_boundary_flex(
+        source_from=date(2024, 7, 1),
+        source_to=date(2024, 12, 31),
+        include_in_period_trades=False,
+        open_position_report_date=date(2024, 6, 30),
+    )
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".xml") as input_file:
+        input_file.write(xml)
+        input_file.flush()
+        with pytest.raises(ValueError, match="no verified period-end OpenPositions checkpoint"):
+            importer.import_files([input_file.name])
+
+
+def test_open_position_uses_its_actual_snapshot_date(sample_ibkr_settings):
+    importer = IbkrImporter(date(2024, 1, 1), date(2024, 12, 31), sample_ibkr_settings)
+    snapshot_date = date(2024, 6, 30)
+    xml = _part_year_boundary_flex(
+        source_from=date(2024, 1, 1),
+        source_to=date(2024, 12, 31),
+        include_in_period_trades=False,
+        open_position_report_date=snapshot_date,
+    )
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".xml") as input_file:
+        input_file.write(xml)
+        input_file.flush()
+        statement = importer.import_files([input_file.name])
+
+    assert statement.listOfSecurities is not None
+    anchor = next(
+        security
+        for security in statement.listOfSecurities.depot[0].security
+        if security.isin == "US0000000009"
+    )
+    assert any(
+        not stock.mutation and stock.referenceDate == snapshot_date + timedelta(days=1)
+        for stock in anchor.stock
+    )
 
 
 def test_ibkr_import_valid_xml(sample_ibkr_settings):

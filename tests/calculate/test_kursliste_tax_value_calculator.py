@@ -6,6 +6,10 @@ import pytest
 
 from opensteuerauszug.calculate.base import CalculationMode
 from opensteuerauszug.calculate.kursliste_tax_value_calculator import KurslisteTaxValueCalculator
+from opensteuerauszug.calculate.payment_reconciliation_calculator import (
+    PaymentReconciliationCalculator,
+)
+from opensteuerauszug.calculate.total import TotalCalculator
 from opensteuerauszug.core.flag_override_provider import FlagOverrideProvider
 from opensteuerauszug.core.kursliste_exchange_rate_provider import KurslisteExchangeRateProvider
 from opensteuerauszug.core.kursliste_manager import KurslisteManager
@@ -18,6 +22,7 @@ from opensteuerauszug.model.ech0196 import (
     Security,
     SecurityTaxValue,
     SecurityStock,
+    SecurityPayment,
     TaxStatement,
     ValorNumber,
 )
@@ -251,6 +256,113 @@ def test_handle_security_tax_value_sets_undefined_when_not_in_kursliste(kurslist
     assert stv.undefined is True
     # kursliste flag should not be set since security wasn't in Kursliste
     assert stv.kursliste is not True
+
+
+def test_kursliste_excludes_payments_before_part_year_start_from_totals_and_reconciliation():
+    period_from = date(2024, 7, 1)
+    period_to = date(2024, 12, 31)
+    payment_on_start = PaymentShare(
+        id=2,
+        paymentDate=period_from,
+        exDate=period_from,
+        currency="CHF",
+        paymentValue=Decimal("2"),
+        paymentValueCHF=Decimal("2"),
+        exchangeRate=Decimal("1"),
+        withHoldingTax=False,
+    )
+    share = Share(
+        id=1,
+        isin="CH0000000001",
+        securityGroup=SecurityGroupESTV.SHARE,
+        securityName="Sanitized Share",
+        institutionId=1,
+        institutionName="Sanitized Issuer",
+        country="CH",
+        currency="CHF",
+        payment=[
+            PaymentShare(
+                id=1,
+                paymentDate=date(2024, 6, 30),
+                exDate=date(2024, 6, 28),
+                currency="CHF",
+                paymentValue=Decimal("1"),
+                paymentValueCHF=Decimal("1"),
+                exchangeRate=Decimal("1"),
+                withHoldingTax=False,
+            ),
+            payment_on_start,
+        ],
+    )
+    kursliste = Kursliste(
+        version="2.2.0.0",
+        creationDate=datetime(2024, 1, 1),
+        year=2024,
+        shares=[share],
+    )
+    kursliste_manager = KurslisteManager()
+    kursliste_manager.kurslisten[2024] = KurslisteAccessor([kursliste], 2024)
+    calculator = KurslisteTaxValueCalculator(
+        mode=CalculationMode.OVERWRITE,
+        exchange_rate_provider=KurslisteExchangeRateProvider(kursliste_manager),
+    )
+    security = Security(
+        country="CH",
+        securityName="Sanitized Share",
+        positionId=1,
+        currency="CHF",
+        quotationType="PIECE",
+        securityCategory="SHARE",
+        isin=ISINType("CH0000000001"),
+        taxValue=SecurityTaxValue(
+            referenceDate=period_to,
+            quotationType="PIECE",
+            quantity=Decimal("10"),
+            balanceCurrency="CHF",
+        ),
+        stock=[
+            SecurityStock(
+                referenceDate=period_from,
+                mutation=False,
+                quotationType="PIECE",
+                quantity=Decimal("10"),
+                balanceCurrency="CHF",
+            )
+        ],
+    )
+    statement = TaxStatement(
+        minorVersion=2,
+        taxPeriod=2024,
+        periodFrom=period_from,
+        periodTo=period_to,
+        listOfSecurities=ListOfSecurities(
+            depot=[Depot(depotNumber=DepotNumber("SANITIZED"), security=[security])]
+        ),
+    )
+
+    calculator.calculate(statement)
+
+    assert [payment.paymentDate for payment in security.payment] == [period_from]
+    assert security.payment[0].grossRevenueB == Decimal("20")
+
+    security.broker_payments = [
+        SecurityPayment(
+            paymentDate=period_from,
+            name="Sanitized broker payment",
+            quotationType="PIECE",
+            quantity=Decimal("10"),
+            amountCurrency="CHF",
+            amount=Decimal("20"),
+        )
+    ]
+    TotalCalculator(mode=CalculationMode.OVERWRITE).calculate(statement)
+    PaymentReconciliationCalculator().calculate(statement)
+
+    assert statement.totalGrossRevenueB == Decimal("20")
+    assert statement.payment_reconciliation_report is not None
+    assert [row.payment_date for row in statement.payment_reconciliation_report.rows] == [
+        period_from
+    ]
 
 
 def test_compute_payments_from_kursliste_missing_ex_date(kursliste_manager):

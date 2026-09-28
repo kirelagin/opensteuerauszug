@@ -114,6 +114,7 @@ class KurslisteTaxValueCalculator(MinimalTaxValueCalculator):
         self._stock_split_warnings: List[dict] = []
         self._previous_year_exdate_warnings = []
         self._all_securities: List[Security] = []
+        self._period_from: Optional[date] = None
 
     def _translate(self, key: str) -> str:
         return get_text(key, self.render_language)
@@ -122,6 +123,7 @@ class KurslisteTaxValueCalculator(MinimalTaxValueCalculator):
         self._missing_kursliste_entries = []
         self._stock_split_warnings = []
         self._previous_year_exdate_warnings = []
+        self._period_from = tax_statement.periodFrom
         # Collect all securities across all depots so that cross-security
         # split validation (valorNumberNew) can look up the target security.
         self._all_securities = []
@@ -591,6 +593,13 @@ class KurslisteTaxValueCalculator(MinimalTaxValueCalculator):
 
         for pay in payments:
             if not pay.paymentDate:
+                continue
+            if self._period_from is not None and pay.paymentDate < self._period_from:
+                logger.debug(
+                    "Skipping Kursliste payment on %s before the reporting period starts on %s.",
+                    pay.paymentDate,
+                    self._period_from,
+                )
                 continue
 
             # Capital gains are not relevant for personal income tax and can be omitted.
