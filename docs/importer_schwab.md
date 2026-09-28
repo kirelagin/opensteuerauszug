@@ -42,6 +42,7 @@ You will need to download data for your Brokerage accounts and any Equity Awards
 * Note that the account number is truncated, we will fix this later in the config file.
 *   **Important**: Schwab typically only allows downloading positions for the *current day*. If you cannot get an exact year-end position file, the system may rely more heavily on transaction data to reconstruct positions, or you might need to use the [Manual Positions Fallback CSV](#3-manual-positions-fallback-csv-optional).
 *   **Important**: the CSV will contain exactly the same columns that you see in the table. If you have previously adjusted the settings using the “Customize” button, make sure the following required columns are present: `Qty (Quantity)`, `Mkt Val (Market Value)`.
+*   **Positions sold after the tax year**: A fully parsed Schwab Positions CSV is treated as a snapshot of the account on its dated export. If a previously traded security is absent, the importer can use zero shares at that snapshot to reconstruct an earlier balance, but only when transaction exports cover every day from the requested period through the snapshot. The manual positions CSV below supplies explicit balances; its format does not indicate whether omitted securities are zero.
 
 **b) Transactions File (JSON)**
 
@@ -142,7 +143,7 @@ If you cannot obtain accurate position files, or if you need to provide initial 
     AWARDS GOOG,2024-01-01,GOOG,20.0,USD
     AWARDS GOOG,2024-01-01,CASH,250.00,USD
     ```
-*   **Usage**: Place this CSV file in the data directory. Rows with errors will be skipped with a logged warning.
+*   **Usage**: Place this CSV file in the data directory. Rows with errors will be skipped with a logged warning. For a security confirmed absent from a complete source statement, use an explicit zero-quantity row if its dated zero balance is needed to reconcile earlier transactions.
 
 ### 4. Recommended: Human readable statements
 

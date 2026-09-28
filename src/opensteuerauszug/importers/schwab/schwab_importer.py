@@ -320,6 +320,10 @@ class SchwabImporter:
         """
         # Track known position dates for each depot
         depot_position_dates = {}
+        # A fully validated Schwab Positions export is treated as an account-wide
+        # snapshot. Manual CSV rows give explicit balances but carry no assertion
+        # that omitted symbols were absent from the account.
+        complete_snapshot_symbols = defaultdict(list)
         # Track covered date ranges for each depot (using DateRangeCoverage)
         depot_coverage = {}
         # Collect all positions for common post-processing
@@ -459,6 +463,17 @@ class SchwabImporter:
                         depot_position_dates[depot] = set()
                     depot_position_dates[depot].add(statement_date)
                     # print(f"Extracted positions from {filename}: {positions}")
+                    if primary_extractor.is_complete_account_snapshot:
+                        complete_snapshot_symbols[depot].append(
+                            (
+                                statement_date,
+                                {
+                                    pos.symbol
+                                    for pos, _ in positions
+                                    if isinstance(pos, SecurityPosition)
+                                },
+                            )
+                        )
                     for pos, stock in positions:
                         all_positions.append((pos, stock, None))
                 else:
@@ -522,6 +537,52 @@ class SchwabImporter:
                 )
         # --- End coverage check ---
 
+        # The downloadable primary Positions CSV is an account-wide snapshot.
+        # For a transaction symbol omitted from a fully parsed snapshot of the
+        # same depot, zero at the snapshot's start-of-day is source-proven. We
+        # require uninterrupted transaction coverage from the requested period
+        # through the preceding day so an omitted symbol cannot bridge a gap.
+        # A complete snapshot supplies one balance per security identity and date,
+        # regardless of how many transaction rows produced that security position.
+        zero_checkpoint_keys = set()
+        for depot, snapshots in complete_snapshot_symbols.items():
+            if depot not in max_ranges:
+                continue
+            coverage = depot_coverage[depot]
+            for snapshot_date, snapshot_symbols in snapshots:
+                if snapshot_date <= self.period_to:
+                    continue
+                checkpoint_end = snapshot_date - timedelta(days=1)
+                if not coverage.is_covered(self.period_from, checkpoint_end):
+                    raise ValueError(
+                        f"Depot {depot}: Complete Schwab positions snapshot on {snapshot_date} "
+                        "cannot be used as a zero checkpoint because transaction coverage "
+                        f"from {self.period_from} through {checkpoint_end} is incomplete."
+                    )
+                for pos, _, _ in list(all_positions):
+                    if not isinstance(pos, SecurityPosition) or pos.depot != depot:
+                        continue
+                    checkpoint_key = (depot, pos.valor, pos.isin, pos.symbol, snapshot_date)
+                    if (
+                        pos.symbol not in snapshot_symbols
+                        and checkpoint_key not in zero_checkpoint_keys
+                    ):
+                        zero_checkpoint_keys.add(checkpoint_key)
+                        all_positions.append(
+                            (
+                                pos,
+                                SecurityStock(
+                                    referenceDate=snapshot_date,
+                                    mutation=False,
+                                    quotationType="PIECE",
+                                    quantity=Decimal("0"),
+                                    balanceCurrency="USD",
+                                    name="Complete Schwab positions snapshot: omitted symbol",
+                                ),
+                                None,
+                            )
+                        )
+
         # Post-process: aggregate stocks/payments per unique Position
         position_map = defaultdict(
             lambda: ([], [])
@@ -580,8 +641,12 @@ class SchwabImporter:
                 )
                 rekeyed = pos_obj.model_copy(update={"depot": display_depot})
                 processed_security_positions[rekeyed] = SecurityPositionData(
-                    stocks=list(initial_stocks),
-                    payments=list(associated_payments),
+                    stocks=self._security_stocks_for_reporting_period(initial_stocks, pos_obj),
+                    payments=[
+                        payment
+                        for payment in associated_payments
+                        if self.period_from <= payment.paymentDate <= self.period_to
+                    ],
                 )
                 display_name = _schwab_security_display_name(pos_obj)
                 if display_name is not None:
@@ -656,8 +721,55 @@ class SchwabImporter:
         return tax_statement
 
     # ------------------------------------------------------------------
-    # CashAccountEntry builders (Schwab-specific naming lives here)
+    # Reporting-period reduction and cash-account builders
     # ------------------------------------------------------------------
+
+    def _security_stocks_for_reporting_period(
+        self, stocks: List[SecurityStock], pos: SecurityPosition
+    ) -> List[SecurityStock]:
+        """Keep tax-year events while retaining boundaries reconciled from all data.
+
+        A later complete snapshot and its following-year sale are evidence for
+        the requested period's balances, not report rows. Reconcile against
+        the complete timeline first, then pass only in-period events and the derived
+        start-of-day boundaries to the XML post-processor.
+        """
+        identifier = pos.get_processing_identifier()
+        reconciler = PositionReconciler(list(stocks), identifier=identifier)
+        is_consistent, _ = reconciler.check_consistency(
+            print_log=True,
+            raise_on_error=self.strict_consistency,
+            assume_zero_if_no_balances=True,
+        )
+        if not is_consistent and not self.strict_consistency:
+            logger.warning(
+                "[%s] Initial consistency check on complete security data failed. "
+                "Review logs. Proceeding with reporting-period synthesis.",
+                identifier,
+            )
+        start = reconciler.synthesize_position_at_date(
+            self.period_from, assume_zero_if_no_balances=True
+        )
+        end_plus_one = self.period_to + timedelta(days=1)
+        end = reconciler.synthesize_position_at_date(end_plus_one, assume_zero_if_no_balances=True)
+        currency = next((stock.balanceCurrency for stock in stocks if stock.balanceCurrency), "USD")
+        in_period = [
+            stock for stock in stocks if self.period_from <= stock.referenceDate <= self.period_to
+        ]
+        for boundary_date, reconciled in ((self.period_from, start), (end_plus_one, end)):
+            if reconciled is not None and not any(
+                not stock.mutation and stock.referenceDate == boundary_date for stock in in_period
+            ):
+                in_period.append(
+                    SecurityStock(
+                        referenceDate=boundary_date,
+                        mutation=False,
+                        quotationType="PIECE",
+                        quantity=reconciled.quantity,
+                        balanceCurrency=currency,
+                    )
+                )
+        return in_period
 
     def _build_settled_cash_entry(
         self,

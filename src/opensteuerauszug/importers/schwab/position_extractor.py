@@ -14,6 +14,10 @@ class PositionExtractor:
 
     def __init__(self, filename: str):
         self.filename = filename
+        # Only a fully validated downloadable positions export is treated as
+        # an account-wide snapshot. The manual CSV format asserts balances for
+        # listed rows but does not declare whether omitted positions are zero.
+        self.is_complete_account_snapshot = False
 
     def extract_positions(self) -> Optional[Tuple[List[Tuple[Position, SecurityStock]], date, str]]:
         """
@@ -134,6 +138,7 @@ class PositionExtractor:
             else:
                 raise ValueError("Schwab positions CSV contains an unrecognized position row")
 
+        self.is_complete_account_snapshot = True
         return positions, ref_date, partial_account_number
 
 
